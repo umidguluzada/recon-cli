@@ -1,0 +1,44 @@
+{
+    "target": "example.com",
+    "timestamp": "2026-09-13T09:04:21.781655+00:00",
+    "subdomains": [
+        "dev.example.com",
+        "example.com",
+        "m.example.com",
+        "products.example.com",
+        "support.example.com",
+        "www.example.com"
+    ],
+    "open_ports": [
+        {
+            "port": 80,
+            "state": "OPEN",
+            "service": "HTTP"
+        },
+        {
+            "port": 443,
+            "state": "OPEN",
+            "service": "HTTPS"
+        },
+        {
+            "port": 8080,
+            "state": "OPEN",
+            "service": "HTTP-Proxy"
+        },
+        {
+            "port": 8443,
+            "state": "OPEN",
+            "service": "HTTPS-Alt"
+        }
+    ],
+    "http_headers": {
+        "Content-Security-Policy": "MISSING",
+        "Strict-Transport-Security": "MISSING",
+        "X-Frame-Options": "MISSING",
+        "X-Content-Type-Options": "MISSING",
+        "Referrer-Policy": "MISSING",
+        "Permissions-Policy": "MISSING",
+        "_status_code": "200",
+        "_final_url": "https://example.com/"
+    }
+}
