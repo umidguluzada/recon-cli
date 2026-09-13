@@ -24,20 +24,16 @@ Fast, asynchronous, terminal-based reconnaissance toolkit for subdomain enumerat
 
 ## Screenshots
 
-> _Add your own terminal screenshots here after running a scan, e.g.:_
-
-```
 ![Subdomain enumeration output](screenshots/subdomains.png)
 ![Port scan output](screenshots/ports.png)
 ![HTTP header audit output](screenshots/headers.png)
-```
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/recon-cli.git
+git clone https://github.com/umidguluzada/recon-cli.git
 cd recon-cli
 python3 -m venv venv
 source venv/bin/activate
