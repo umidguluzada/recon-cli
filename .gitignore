@@ -1,5 +1,10 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 report.json
+report.html
+reports/
 .env
+.pytest_cache/
+.mypy_cache/

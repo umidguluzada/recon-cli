@@ -1,126 +1,169 @@
-"""
-Subdomain enumeration module using Certificate Transparency logs (crt.sh).
-"""
+"""Passive subdomain enumeration via Certificate Transparency logs."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-import re
-import time
-from typing import List, Set
+from typing import Any
 
-import requests
+import aiohttp
 
-# Valid hostname label: letters, digits, hyphens (no leading/trailing hyphen)
-_HOSTNAME_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
-)
+from modules.base import ReconModule
+from utils.constants import MAX_HTTP_BODY_BYTES
+from utils.models import ParsedTarget
+from utils.validators import belongs_to_domain, is_subdomain_name, normalize_host
+
+CRT_SH_URL = "https://crt.sh/"
 
 
-class SubdomainEnumerator:
-    """Enumerates subdomains for a given domain via crt.sh CT log search."""
+def extract_subdomains(entries: Any, domain: str) -> list[str]:
+    """Pull unique child names out of a crt.sh JSON payload."""
+    if not isinstance(entries, list):
+        raise ValueError("crt.sh response was not a JSON array.")
 
-    CRT_SH_URL = "https://crt.sh/"
+    found: set[str] = set()
+    apex = normalize_host(domain)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name_value = entry.get("name_value", "")
+        if not isinstance(name_value, str):
+            continue
+        for line in name_value.replace("\r", "\n").split("\n"):
+            candidate = line.strip().lower().rstrip(".")
+            if not candidate or "@" in candidate or " " in candidate:
+                continue
+            if candidate.startswith("*."):
+                candidate = candidate[2:]
+            if "*" in candidate:
+                continue
+            try:
+                candidate = normalize_host(candidate)
+            except ValueError:
+                continue
+            if not is_subdomain_name(candidate):
+                continue
+            if belongs_to_domain(candidate, apex):
+                found.add(candidate)
+    return sorted(found)
+
+
+class SubdomainEnumerator(ReconModule):
+    """Queries crt.sh and returns validated names for one domain."""
+
+    name = "subdomains"
+    label = "Subdomains"
 
     def __init__(
         self,
-        domain: str,
-        timeout: int = 15,
-        max_retries: int = 3,
-        retry_delay: float = 3.0,
+        target: ParsedTarget,
+        session: aiohttp.ClientSession,
+        *,
+        timeout: float = 20.0,
+        retries: int = 3,
+        retry_delay: float = 2.0,
+        module_timeout: float = 180.0,
+        logger: Any = None,
     ) -> None:
-        self.domain = domain.strip().lower()
+        super().__init__(module_timeout=module_timeout, logger=logger)
+        self.target = target
+        self.session = session
         self.timeout = timeout
-        self.max_retries = max_retries
+        self.retries = retries
         self.retry_delay = retry_delay
 
-    def _is_valid_subdomain(self, candidate: str) -> bool:
-        """
-        Validate that a candidate string is a proper subdomain of
-        self.domain — not an email, CA metadata string, or a
-        different domain that merely shares a suffix substring.
-        """
-        if "@" in candidate or " " in candidate:
-            return False
+    async def execute(self) -> tuple[list[Any], dict[str, Any]]:
+        if self.target.is_ip:
+            reason = "Subdomain enumeration requires a domain name, not an IP address."
+            return [], {
+                "source": "crt.sh",
+                "skipped": True,
+                "reason": reason,
+                "display_count": 0,
+            }
 
-        if not _HOSTNAME_RE.match(candidate):
-            return False
+        domain = self.target.host
+        query = f"%.{domain}"
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        last_status: int | None = None
 
-        if candidate == self.domain:
-            return True
-
-        # Must end with ".<domain>" (proper label boundary), not just
-        # a raw substring match like "testexample.com".endswith("example.com")
-        return candidate.endswith(f".{self.domain}")
-
-    def enumerate(self) -> List[str]:
-        """
-        Query crt.sh for certificates matching the domain and extract
-        unique, valid subdomains. Retries on transient server-side
-        errors (crt.sh is frequently overloaded).
-
-        Returns:
-            A sorted list of unique subdomains (excluding wildcards,
-            emails, and unrelated domains).
-        """
-        params = {"q": f"%.{self.domain}", "output": "json"}
-        subdomains: Set[str] = set()
-
-        response = None
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, self.retries + 1):
             try:
-                response = requests.get(
-                    self.CRT_SH_URL, params=params, timeout=self.timeout
+                payload = await self._fetch(query, timeout)
+                names = extract_subdomains(payload, domain)
+                return names, {
+                    "source": "crt.sh",
+                    "query": query,
+                    "attempts": attempt,
+                    "certificates": len(payload) if isinstance(payload, list) else 0,
+                    "display_count": len(names),
+                }
+            except _TransientError as exc:
+                last_status = exc.status
+                self.logger.warning(
+                    f"[subdomains] crt.sh unavailable ({exc}), "
+                    f"attempt {attempt}/{self.retries}."
                 )
-                response.raise_for_status()
-                break
-            except requests.exceptions.Timeout:
-                print(
-                    f"[!] crt.sh request timed out (attempt {attempt}/{self.max_retries})"
+            except aiohttp.ClientError as exc:
+                last_status = None
+                self.logger.warning(
+                    f"[subdomains] connection error ({exc.__class__.__name__}), "
+                    f"attempt {attempt}/{self.retries}."
                 )
-            except requests.exceptions.ConnectionError:
-                print(
-                    f"[!] Connection error reaching crt.sh (attempt {attempt}/{self.max_retries})"
+            except TimeoutError:
+                self.logger.warning(
+                    f"[subdomains] crt.sh timed out, attempt {attempt}/{self.retries}."
                 )
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else None
-                if status in (502, 503, 504):
-                    print(
-                        f"[!] crt.sh temporarily unavailable ({status}), "
-                        f"retrying (attempt {attempt}/{self.max_retries})..."
-                    )
-                else:
-                    print(f"[!] HTTP error from crt.sh: {exc}")
-                    return []
-            except requests.exceptions.RequestException as exc:
-                print(f"[!] Unexpected request error: {exc}")
-                return []
+            except ValueError as exc:
+                self.errors.append(str(exc))
+                return [], {
+                    "source": "crt.sh",
+                    "query": query,
+                    "attempts": attempt,
+                    "display_count": 0,
+                }
 
-            if attempt < self.max_retries:
-                time.sleep(self.retry_delay * attempt)
+            if attempt < self.retries:
+                await asyncio.sleep(self.retry_delay * attempt)
 
-        if response is None or response.status_code != 200:
-            print(
-                f"[!] Failed to reach crt.sh after {self.max_retries} attempts. "
-                "The service may be overloaded — try again in a minute."
-            )
-            return []
+        self.errors.append(
+            f"crt.sh did not return a usable result after {self.retries} attempts."
+        )
+        return [], {
+            "source": "crt.sh",
+            "query": query,
+            "attempts": self.retries,
+            "last_status": last_status,
+            "display_count": 0,
+        }
 
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            print("[!] Failed to parse crt.sh response as JSON (empty or malformed).")
-            return []
+    async def _fetch(self, query: str, timeout: aiohttp.ClientTimeout) -> Any:
+        async with self.session.get(
+            CRT_SH_URL,
+            params={"q": query, "output": "json"},
+            timeout=timeout,
+        ) as response:
+            if response.status in {429, 500, 502, 503, 504}:
+                raise _TransientError(response.status)
+            if response.status >= 400:
+                raise ValueError(f"crt.sh returned HTTP {response.status}.")
 
-        for entry in data:
-            name_value = entry.get("name_value", "")
-            for line in name_value.split("\n"):
-                candidate = line.strip().lower()
-                if not candidate:
-                    continue
-                if candidate.startswith("*."):
-                    candidate = candidate[2:]
-                if self._is_valid_subdomain(candidate):
-                    subdomains.add(candidate)
+            raw = await response.content.read(MAX_HTTP_BODY_BYTES + 1)
+            if len(raw) > MAX_HTTP_BODY_BYTES:
+                raise ValueError("crt.sh response exceeded the 20 MB response limit.")
+            if not raw.strip():
+                raise _TransientError(response.status or 204)
 
-        return sorted(subdomains)
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError as exc:
+                raise _TransientError(response.status) from exc
+            if not isinstance(payload, list):
+                raise _TransientError(response.status)
+            return payload
+
+
+class _TransientError(Exception):
+    def __init__(self, status: int) -> None:
+        self.status = status
+        super().__init__(f"HTTP {status}" if status else "empty response")
